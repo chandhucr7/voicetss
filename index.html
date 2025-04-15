@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Bhai ka Free Audio Editor</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      padding: 20px;
+      background-color: #f0f0f0;
+    }
+    h1 {
+      color: #333;
+    }
+    .controls {
+      margin: 20px auto;
+      max-width: 600px;
+      background: white;
+      padding: 20px;
+      border-radius: 10px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    }
+    input, button, label {
+      margin: 10px;
+    }
+    input[type="range"] {
+      width: 200px;
+    }
+    button {
+      padding: 10px 20px;
+      background-color: #007bff;
+      color: white;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #0056b3;
+    }
+    #status {
+      color: red;
+      margin-top: 10px;
+      font-size: 16px;
+    }
+    #waveform {
+      margin: 20px auto;
+      max-width: 600px;
+    }
+    canvas {
+      width: 100%;
+      height: 150px;
+      border: 1px solid #ccc;
+    }
+  </style>
+</head>
+<body>
+  <h1>Bhai ka Free Audio Editor</h1>
+  <div class="controls">
+    <input type="file" id="audioInput" accept="audio/*">
+    <div id="waveform">
+      <canvas id="waveformCanvas"></canvas>
+    </div>
+    <div>
+      <label>Pitch Adjust: </label>
+      <input type="range" id="pitch" min="-1200" max="1200" value="0">
+      <span id="pitchValue">0</span> cents
+    </div>
+    <div>
+      <label>Volume: </label>
+      <input type="range" id="volume" min="0" max="2" step="0.1" value="1">
+      <span id="volumeValue">100%</span>
+    </div>
+    <div>
+      <label>Speed: </label>
+      <input type="range" id="speed" min="0.5" max="2" step="0.1" value="1">
+      <span id="speedValue">100%</span>
+    </div>
+    <div>
+      <label><input type="checkbox" id="trimSilence"> Trim Silent Parts</label>
+    </div>
+    <div>
+      <label><input type="checkbox" id="reverb"> Add Reverb</label>
+    </div>
+    <div>
+      <label><input type="checkbox" id="voiceChange"> Male to Female Voice</label>
+    </div>
+    <button onclick="playAudio()">Play Audio</button>
+    <button onclick="downloadAudio()">Download Audio</button>
+    <div id="status"></div>
+  </div>
+
+  <!-- Load SoundTouch.js -->
+  <script src="https://cdn.jsdelivr.net/npm/soundtouch@0.0.1/soundtouch.min.js"></script>
+  <!-- Load FFmpeg.wasm -->
+  <script>
+    let FFmpeg = null;
+    const status = document.getElementById('status');
+
+    async function loadFFmpeg() {
+      status.textContent = 'Loading FFmpeg...';
+      try {
+        const script = document.createElement('script');
+        script.src = 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.min.js';
+        script.onload = () => {
+          FFmpeg = window.FFmpeg;
+          status.textContent = 'FFmpeg loaded!';
+        };
+        script.onerror = () => {
+          status.textContent = 'Failed to load FFmpeg. Using WAV fallback for download.';
+        };
+        document.head.appendChild(script);
+      } catch (err) {
+        status.textContent = 'FFmpeg load error: ' + err.message;
+      }
+    }
+    loadFFmpeg();
+  </script>
+
+  <script>
+    let audioContext = new AudioContext();
+    let audioBuffer, source;
+    const canvas = document.getElementById('waveformCanvas');
+    const ctx = canvas.getContext('2d');
+    let animationFrameId;
+
+    // Update slider values
+    document.getElementById('pitch').addEventListener('input', () => {
+      document.getElementById('pitchValue').textContent = document.getElementById('pitch').value;
+    });
+    document.getElementById('volume').addEventListener('input', () => {
+      document.getElementById('volumeValue').textContent = Math.round(document.getElementById('volume').value * 100) + '%';
+    });
+    document.getElementById('speed').addEventListener('input', () => {
+      document.getElementById('speedValue').textContent = Math.round(document.getElementById('speed').value * 100) + '%';
+    });
+
+    // Draw waveform
+    function drawWaveform(buffer, highlightTrim = false, trimStart = 0, trimEnd = 0) {
+      const width = canvas.width = canvas.offsetWidth;
+      const height = canvas.height = 150;
+      const data = buffer.getChannelData(0);
+      const step = Math.ceil(data.length / width);
+      const amp = height / 2;
+
+      ctx.clearRect(0, 0, width, height);
+      ctx.beginPath();
+      ctx.strokeStyle = '#007bff';
+      ctx.lineWidth = 2;
+
+      for (let i = 0; i < width; i++) {
+        let min = 1.0;
+        let max = -1.0;
+        for (let j = 0; j < step; j++) {
+          const datum = data[(i * step) + j] || 0;
+          if (datum < min) min = datum;
+          if (datum > max) max = datum;
+        }
+        ctx.moveTo(i, (1 + min) * amp);
+        ctx.lineTo(i, (1 + max) * amp);
+      }
+      ctx.stroke();
+
+      // Highlight trimmed areas
+      if (highlightTrim && trimEnd > trimStart) {
+        const startX = (trimStart / data.length) * width;
+        const endX = (trimEnd / data.length) * width;
+        ctx.fillStyle = 'rgba(255, 0, 0, 0.2)';
+        ctx.fillRect(0, 0, startX, height);
+        ctx.fillRect(endX, 0, width - endX, height);
+      }
+    }
+
+    // Audio upload
+    document.getElementById('audioInput').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      status.textContent = 'Loading audio...';
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+        drawWaveform(audioBuffer);
+        status.textContent = 'Audio loaded!';
+      } catch (err) {
+        status.textContent = 'Error loading audio: ' + err.message;
+      }
+    });
+
+    // Silence trimming
+    function trimSilence(buffer, threshold = 0.01) {
+      const channelData = buffer.getChannelData(0);
+      const sampleRate = buffer.sampleRate;
+      let start = 0, end = channelData.length;
+
+      for (let i = 0; i < channelData.length; i++) {
+        if (Math.abs(channelData[i]) > threshold) {
+          start = i;
+          break;
+        }
+      }
+
+      for (let i = channelData.length - 1; i >= 0; i--) {
+        if (Math.abs(channelData[i]) > threshold) {
+          end = i + 1;
+          break;
+        }
+      }
+
+      const newBuffer = audioContext.createBuffer(
+        buffer.numberOfChannels,
+        end - start,
+        sampleRate
+      );
+      for (let i = 0; i < buffer.numberOfChannels; i++) {
+        newBuffer.copyToChannel(
+          buffer.getChannelData(i).slice(start, end),
+          i
+        );
+      }
+      return { buffer: newBuffer, trimStart: start, trimEnd: end };
+    }
+
+    // Reverb
+    function createReverb(context) {
+      const reverb = context.createConvolver();
+      const length = context.sampleRate * 0.5;
+      const impulse = context.createBuffer(2, length, context.sampleRate);
+      for (let channel = 0; channel < 2; channel++) {
+        const impulseData = impulse.getChannelData(channel);
+        for (let i = 0; i < length; i++) {
+          impulseData[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, 3);
+        }
+      }
+      reverb.buffer = impulse;
+      return reverb;
+    }
+
+    // Play audio
+    async function playAudio() {
+      if (!audioBuffer) {
+        status.textContent = 'Pehle audio upload karo!';
+        return;
+      }
+      if (source) source.stop();
+
+      let processedBuffer = audioBuffer;
+      let trimStart = 0, trimEnd = 0;
+      if (document.getElementById('trimSilence').checked) {
+        const trimResult = trimSilence(audioBuffer);
+        processedBuffer = trimResult.buffer;
+        trimStart = trimResult.trimStart;
+        trimEnd = trimResult.trimEnd;
+      }
+
+      drawWaveform(processedBuffer, document.getElementById('trimSilence').checked, trimStart, trimEnd);
+
+      source = audioContext.createBufferSource();
+      source.buffer = processedBuffer;
+
+      const gainNode = audioContext.createGain();
+      gainNode.gain.value = parseFloat(document.getElementById('volume').value);
+
+      source.playbackRate.value = parseFloat(document.getElementById('speed').value);
+
+      const pitchValue = document.getElementById('pitch').value;
+      source.detune.value = pitchValue;
+
+      if (document.getElementById('voiceChange').checked) {
+        source.detune.value = parseInt(pitchValue) + 600;
+      }
+
+      let finalNode = gainNode;
+      if (document.getElementById('reverb').checked) {
+        const reverbNode = createReverb(audioContext);
+        gainNode.connect(reverbNode);
+        finalNode = reverbNode;
+        ctx.fillStyle = 'rgba(0, 255, 0, 0.1)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+
+      source.connect(gainNode);
+      finalNode.connect(audioContext.destination);
+
+      // Waveform playback cursor
+      const startTime = audioContext.currentTime;
+      function updateCursor() {
+        const duration = processedBuffer.duration / source.playbackRate.value;
+        const elapsed = audioContext.currentTime - startTime;
+        const progress = elapsed / duration;
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        drawWaveform(processedBuffer, document.getElementById('trimSilence').checked, trimStart, trimEnd);
+        ctx.beginPath();
+        ctx.strokeStyle = 'red';
+        ctx.lineWidth = 2;
+        ctx.moveTo(progress * canvas.width, 0);
+        ctx.lineTo(progress * canvas.width, canvas.height);
+        ctx.stroke();
+
+        if (progress < 1) {
+          animationFrameId = requestAnimationFrame(updateCursor);
+        }
+      }
+
+      source.onended = () => cancelAnimationFrame(animationFrameId);
+      source.start();
+      updateCursor();
+      status.textContent = 'Playing audio...';
+    }
+
+    // Download audio
+    async function downloadAudio() {
+      if (!audioBuffer) {
+        status.textContent = 'Pehle audio upload karo!';
+        return;
+      }
+
+      status.textContent = 'Processing audio...';
+      try {
+        let processedBuffer = audioBuffer;
+        if (document.getElementById('trimSilence').checked) {
+          processedBuffer = trimSilence(audioBuffer).buffer;
+        }
+
+        const wav = await audioBufferToWav(processedBuffer);
+        status.textContent = 'Preparing download...';
+
+        if (FFmpeg) {
+          status.textContent = 'Converting to MP3...';
+          const { createFFmpeg, fetchFile } = FFmpeg;
+          const ffmpeg = createFFmpeg({ log: true });
+          try {
+            await ffmpeg.load();
+          } catch (err) {
+            status.textContent = 'FFmpeg load failed. Downloading WAV...';
+            throw new Error('FFmpeg unavailable');
+          }
+
+          ffmpeg.FS('writeFile', 'input.wav', await fetchFile(wav));
+
+          let command = ['-i', 'input.wav'];
+          if (document.getElementById('voiceChange').checked) {
+            command.push('-af', 'asetrate=44100*1.3,aresample=44100');
+          }
+          if (parseFloat(document.getElementById('speed').value) !== 1) {
+            command.push('-filter:a', `atempo=${document.getElementById('speed').value}`);
+          }
+          if (parseFloat(document.getElementById('volume').value) !== 1) {
+            command.push('-filter:a', `volume=${document.getElementById('volume').value}`);
+          }
+          if (parseInt(document.getElementById('pitch').value) !== 0) {
+            command.push('-af', `rubberband=pitch=${1 + parseInt(document.getElementById('pitch').value) / 1200}`);
+          }
+          command.push('output.mp3');
+
+          status.textContent = 'Applying effects...';
+          await ffmpeg.run(...command);
+
+          const data = ffmpeg.FS('readFile', 'output.mp3');
+          const url = URL.createObjectURL(new Blob([data.buffer], { type: 'audio/mp3' }));
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'edited_audio.mp3';
+          a.click();
+
+          status.textContent = 'MP3 download started!';
+        } else {
+          status.textContent = 'FFmpeg not available, downloading WAV...';
+          const url = URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }));
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'edited_audio.wav';
+          a.click();
+          status.textContent = 'WAV download started!';
+        }
+      } catch (err) {
+        status.textContent = 'Download error: ' + err.message;
+        console.error(err);
+      }
+    }
+
+    // Convert AudioBuffer to WAV
+    async function audioBufferToWav(buffer) {
+      const numChannels = buffer.numberOfChannels;
+      const sampleRate = buffer.sampleRate;
+      const length = buffer.length * numChannels * 2 + 44;
+      const arrayBuffer = new ArrayBuffer(length);
+      const view = new DataView(arrayBuffer);
+
+      const writeString = (view, offset, string) => {
+        for (let i = 0; i < string.length; i++) {
+          view.setUint8(offset + i, string.charCodeAt(i));
+        }
+      };
+
+      writeString(view, 0, 'RIFF');
+      view.setUint32(4, 36 + buffer.length * numChannels * 2, true);
+      writeString(view, 8, 'WAVE');
+      writeString(view, 12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, numChannels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * numChannels * 2, true);
+      view.setUint16(32, numChannels * 2, true);
+      view.setUint16(34, 16, true);
+      writeString(view, 36, 'data');
+      view.setUint32(40, buffer.length * numChannels * 2, true);
+
+      const offset = 44;
+      for (let i = 0; i < buffer.length; i++) {
+        for (let channel = 0; channel < numChannels; channel++) {
+          const sample = buffer.getChannelData(channel)[i];
+          const value = Math.max(-1, Math.min(1, sample)) * 32767;
+          view.setInt16(offset + (i * numChannels + channel) * 2, value, true);
+        }
+      }
+
+      return arrayBuffer;
+    }
+  </script>
+</body>
+</html>
